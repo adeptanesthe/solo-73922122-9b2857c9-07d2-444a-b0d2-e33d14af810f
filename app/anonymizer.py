@@ -227,6 +227,12 @@ def _build_plan(rows: list[Row], age_level: int, zip_level: int,
         "removed_ids": [rows[i].subject_id for i in removed_idx],
         "output_rows": output_rows,
         "groups": group_view,
+        # 最终保留者的编号 -> 当批病种，仅用于发布时原子留痕（转归矩阵配对），
+        # 不进入预览页面，也不写入可下载的匿名 CSV。
+        "retained_subjects": [
+            {"subject_id": r.subject_id, "disease": r.disease}
+            for i, r in enumerate(rows) if i not in removed_set
+        ],
     }
 
 

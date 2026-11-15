@@ -13,6 +13,7 @@ from fastapi.templating import Jinja2Templates
 
 from . import anonymizer as az
 from . import database as db
+from . import transition as tr
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR.parent / "data" / "anonymizer.db"
@@ -42,11 +43,17 @@ def _home_context() -> dict:
     with db.connect(db_path()) as conn:
         pending = db.get_latest_pending(conn)
         published = db.list_published(conn)
+        # 仅用于下拉框可用性提示；真正的资格校验在计算时的同一事务快照内完成
+        computable = {
+            r["batch_id"] for r in conn.execute(
+                "SELECT DISTINCT batch_id FROM batch_subjects")
+        }
     pending_plan = az.plan_from_json(pending["plan_json"]) if pending else None
     return {
         "pending": pending,
         "pending_plan": pending_plan,
         "published": published,
+        "computable_ids": computable,
         "error": None,
         "info": None,
     }
@@ -99,9 +106,13 @@ def publish(request: Request, batch_id: int, confirm: str = Form("")):
             plan = az.plan_from_json(row["plan_json"])
             if plan is None or not az.verify_output(plan["output_rows"]):
                 raise RuntimeError("匿名结果未通过发布前复核")
+            retained = [(item["subject_id"], item["disease"])
+                        for item in plan.get("retained_subjects", [])]
+            if not retained or len(retained) != len(plan["output_rows"]):
+                raise RuntimeError("最终保留者对应关系缺失，发布中止")
             output_csv = az.render_output_csv(plan["output_rows"])
             output_filename = f"anonymous_batch_{batch_id}.csv"
-            db.publish_batch(conn, batch_id, output_csv, output_filename)
+            db.publish_batch(conn, batch_id, output_csv, output_filename, retained)
         except (LookupError, RuntimeError) as exc:
             ctx = _home_context()
             ctx["error"] = str(exc)
@@ -126,3 +137,46 @@ def download(batch_id: int):
                     f"attachment; filename={fname}; filename*=UTF-8''{quote(fname)}"
             },
         )
+
+
+@app.get("/transition", response_class=HTMLResponse)
+def transition(request: Request, earlier: str = "", later: str = ""):
+    """比较两批已发布随访数据，展示「前次病种 -> 后次病种」人数矩阵。
+
+    两批的发布状态与受试者-病种对应关系取自同一个已提交视图（同一事务快照）；
+    未发布/发布失败批次与缺少对应关系的旧批次一律拒绝计算，且不按零人处理。
+    响应中不包含任何受试者号。
+    """
+    ctx = _home_context()
+    if not earlier or not later:
+        ctx["error"] = "请选择前次与后次两个已发布批次"
+        return _render(request, "index.html", status_code=400, **ctx)
+    try:
+        earlier_id, later_id = int(earlier), int(later)
+    except ValueError:
+        ctx["error"] = "批次编号无效"
+        return _render(request, "index.html", status_code=400, **ctx)
+    if earlier_id == later_id:
+        ctx["error"] = "请选择两个不同的批次进行比较"
+        return _render(request, "index.html", status_code=400, **ctx)
+
+    with db.connect(db_path()) as conn:
+        try:
+            earlier_batch, later_batch, earlier_map, later_map = (
+                db.load_transition_view(conn, earlier_id, later_id))
+        except db.TransitionError as exc:
+            ctx["error"] = f"无法计算转归矩阵：{exc}"
+            return _render(request, "index.html", status_code=409, **ctx)
+
+        matrix = tr.build_transition_matrix(earlier_map, later_map)
+
+    ctx["transition"] = {
+        "earlier": earlier_batch,
+        "later": later_batch,
+        "matrix": matrix,  # None 表示两批保留者无共同编号
+    }
+    if matrix is None:
+        ctx["info"] = (
+            f"批次 #{earlier_id} 与批次 #{later_id} 实际保留的受试者号没有交集，"
+            "无法配对（并非零人，而是没有可配对的同一受试者）。")
+    return _render(request, "index.html", **ctx)

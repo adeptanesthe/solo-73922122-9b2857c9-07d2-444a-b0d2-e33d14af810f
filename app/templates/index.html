@@ -9,7 +9,7 @@
 <body>
 <header>
   <h1>临床数据匿名化发布平台</h1>
-  <p class="subtitle">小群体消除 · k-匿名（每组 ≥ 3 人且 ≥ 2 种病种）· 发布前移除受试者号</p>
+  <p class="subtitle">小群体消除 · k-匿名（每组 ≥ 3 人且 ≥ 2 种病种）· 发布前移除受试者号 · 随访病种转归矩阵</p>
 </header>
 
 <main>
@@ -89,7 +89,7 @@
     <h2>3. 已发布的匿名文件</h2>
     {% if published %}
     <table>
-      <thead><tr><th>批次</th><th>来源文件</th><th>发布时间</th><th>行数</th><th>下载</th></tr></thead>
+      <thead><tr><th>批次</th><th>来源文件</th><th>发布时间</th><th>行数</th><th>下载</th><th>转归可计算</th></tr></thead>
       <tbody>
       {% for b in published %}
         <tr>
@@ -98,12 +98,93 @@
           <td>{{ b.created_at }}</td>
           <td class="num">{{ b.row_count }}</td>
           <td><a class="dl" href="/download/{{ b.id }}">{{ b.output_filename }}</a></td>
+          <td>{% if b.id in computable_ids %}是{% else %}<span class="warn">否（旧批次，无对应关系）</span>{% endif %}</td>
         </tr>
       {% endfor %}
       </tbody>
     </table>
     {% else %}
     <p class="hint">尚无已发布文件。</p>
+    {% endif %}
+  </section>
+
+  <section class="card" id="transition">
+    <h2>4. 随访病种转归矩阵</h2>
+    <p class="hint">选择先后两批已发布数据，系统按两批<strong>实际共同保留的受试者号</strong>配对，
+      统计「前次病种 → 后次病种」的人数。少于 3 人的格显示隐藏标记 <code>{{ '***' }}</code>，
+      且不展示可反推其人数的行/列合计；本页面不返回任何受试者号。</p>
+    {% if published %}
+    <form action="/transition" method="get" class="transition-form">
+      <label>前次批次
+        <select name="earlier" required>
+          <option value="" disabled selected>请选择</option>
+          {% for b in published %}
+          <option value="{{ b.id }}">#{{ b.id }} {{ b.source_filename }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <span class="arrow">→</span>
+      <label>后次批次
+        <select name="later" required>
+          <option value="" disabled selected>请选择</option>
+          {% for b in published %}
+          <option value="{{ b.id }}">#{{ b.id }} {{ b.source_filename }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button type="submit" class="primary">计算转归矩阵</button>
+    </form>
+    {% else %}
+    <p class="hint">尚无已发布批次，无法计算转归矩阵。请先上传并发布至少两批随访数据。</p>
+    {% endif %}
+
+    {% if transition %}
+    {% set t = transition %}
+    <div class="matrix-head">
+      <h3>批次 #{{ t.earlier.id }}（{{ t.earlier.source_filename }}）
+        → 批次 #{{ t.later.id }}（{{ t.later.source_filename }}）</h3>
+    </div>
+    {% if t.matrix %}
+    {% set m = t.matrix %}
+    <p class="hint">共同保留并成功配对的受试者：<strong>{{ m.paired_subject_count }}</strong> 人
+      ｜ 单元格人数 &lt; {{ m.min_cell }} 时显示 <code>{{ '***' }}</code>，
+      含隐藏格的行/列合计同步隐藏{% if m.grand_suppressed %}，总合计因存在隐藏格而隐藏{% endif %}。</p>
+    <table class="matrix">
+      <thead>
+        <tr>
+          <th>前次病种 ＼ 后次病种</th>
+          {% for c in m.col_labels %}<th>{{ c }}</th>{% endfor %}
+          <th>行合计</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in m.row_labels %}
+        <tr>
+          <th>{{ r }}</th>
+          {% for cell in m.cells if cell.row == r %}
+          <td class="num {% if cell.suppressed %}suppressed{% endif %}">{{ cell.value }}</td>
+          {% endfor %}
+          {% for rt in m.row_totals if rt.row == r %}
+          <td class="num total {% if rt.suppressed %}suppressed{% endif %}">{{ rt.value }}</td>
+          {% endfor %}
+        </tr>
+      {% endfor %}
+      </tbody>
+      <tfoot>
+        <tr>
+          <th>列合计</th>
+          {% for ct in m.col_totals %}
+          <td class="num total {% if ct.suppressed %}suppressed{% endif %}">{{ ct.value }}</td>
+          {% endfor %}
+          <td class="num total grand {% if m.grand_suppressed %}suppressed{% endif %}">{{ m.grand_total }}</td>
+        </tr>
+      </tfoot>
+    </table>
+    <p class="hint legend"><code>{{ '***' }}</code> = 该格人数少于 {{ m.min_cell }} 人（含 0 人），
+      为防止反推个人信息而隐藏，且不提供可反推该人数的合计。</p>
+    {% else %}
+    <p class="hint">两批实际保留的受试者号无交集，未生成矩阵。</p>
+    {% endif %}
     {% endif %}
   </section>
 
@@ -115,6 +196,10 @@
       <li>最多剔除 2 行；保留数据中每个（年龄, 邮编）组合须至少 3 人，且包含至少两种病种。</li>
       <li>在全部可行方案中选择两列隐藏等级之和最小者；同级先少剔除，再优先保留年龄精度。</li>
       <li>再次上传后，旧预览立即失效且不可发布；发布失败不会产生任何可下载残件。</li>
+      <li>发布时，最终保留者的编号与当批病种、发布状态在同一事务原子保存。</li>
+      <li>转归矩阵仅按两批共同保留的受试者号配对；未发布/发布失败批次不参与计算，
+        缺少对应关系的旧批次提示「无法计算」，不按零人处理。</li>
+      <li>少于 3 人的格（含 0 人格）显示 <code>***</code>，含隐藏格的行/列合计及总合计一并隐藏，无法反推人数；矩阵不返回受试者号。</li>
     </ul>
   </section>
 </main>
